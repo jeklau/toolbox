@@ -1,7 +1,8 @@
+cat << 'EOF' > /tmp/bbr_setup.sh
 #!/bin/sh
 
 # ============================================================
-# iStoreOS BBR 深度优化脚本 (N100 专用，仅在24.10上进行测试)
+# iStoreOS BBR & 双千兆网络深度优化脚本 (N100 专用)
 # ============================================================
 
 echo "开始执行网络优化..."
@@ -52,3 +53,7 @@ echo "当前算法: $(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
 echo "当前队列: $(sysctl net.core.default_qdisc | awk '{print $3}')"
 echo "------------------------------------------------"
 EOF
+
+# 赋予权限并执行
+chmod +x /tmp/bbr_setup.sh
+sh /tmp/bbr_setup.sh
