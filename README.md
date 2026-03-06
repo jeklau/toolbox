@@ -16,7 +16,7 @@ bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/bbr-smart.
 
 增加NFT转发
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/nft_forward_manager.sh)
+bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/nft-manager.sh)
 ```
 
 VPS初始化
