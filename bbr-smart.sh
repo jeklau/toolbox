@@ -1,178 +1,223 @@
 #!/bin/bash
-# BBR Blast Smooth v2 - Auto-detect OS/Memory Smart Tuning
-# Supports Debian 11/12/13, Ubuntu 20.04/22.04/24.04
-# Auto-adjust buffer size based on memory
+# BBR Blast Smooth v2 - 自动识别系统/内存智能调优版
+# 支持 Debian 11/12/13, Ubuntu 20.04/22.04/24.04, iStoreOS/OpenWrt
+# 根据内存大小自动调整缓冲区参数 🚀
 
 set -e
 
-# Colors
-RED="\033[0;31m"
-GREEN="\033[0;32m"
-YELLOW="\033[1;33m"
-BLUE="\033[0;34m"
-NC="\033[0m"
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}   BBR Blast Smooth v2 Smart Tuning${NC}"
+echo -e "${BLUE}   BBR Blast Smooth v2 智能调优版${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-# Detect OS
+# 检测系统
 detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$ID
-        VER=$VERSION_ID
+        VER=${VERSION_ID:-"unknown"}
+        
+        # 兼容处理 iStoreOS/OpenWrt
+        if [[ "$ID" == "istoreos" || "$NAME" == *"iStoreOS"* || "$ID" == "openwrt" ]]; then
+            OS="openwrt"
+        fi
     else
-        echo -e "${RED}[X] Cannot detect OS${NC}"
+        echo -e "${RED}❌ 无法识别系统${NC}"
         exit 1
     fi
+    
     case "$OS" in
         debian)
             if [[ "$VER" =~ ^(11|12|13)$ ]]; then
-                echo -e "${GREEN}[OK] Detected Debian $VER${NC}"
+                echo -e "${GREEN}✓ 检测到 Debian $VER${NC}"
             else
-                echo -e "${RED}[X] Only Debian 11/12/13 supported${NC}"
+                echo -e "${RED}❌ 仅支持 Debian 11/12/13${NC}"
                 exit 1
             fi
             ;;
         ubuntu)
             if [[ "$VER" =~ ^(20.04|22.04|24.04)$ ]]; then
-                echo -e "${GREEN}[OK] Detected Ubuntu $VER${NC}"
+                echo -e "${GREEN}✓ 检测到 Ubuntu $VER${NC}"
             else
-                echo -e "${RED}[X] Only Ubuntu 20.04/22.04/24.04 supported${NC}"
+                echo -e "${RED}❌ 仅支持 Ubuntu 20.04/22.04/24.04${NC}"
                 exit 1
             fi
             ;;
+        openwrt)
+            echo -e "${GREEN}✓ 检测到 iStoreOS/OpenWrt ($VER)${NC}"
+            ;;
         *)
-            echo -e "${RED}[X] Unsupported OS: $OS${NC}"
+            echo -e "${RED}❌ 不支持的系统: $OS${NC}"
             exit 1
             ;;
     esac
 }
 
-# Detect memory
+# 检测内存并设置参数
 detect_memory() {
-    TOTAL_MEM=$(free -m | awk "/^Mem:/{print \$2}")
-    echo -e "${GREEN}[OK] Memory: ${TOTAL_MEM}MB${NC}"
+    # 弃用 free -m 以兼容 BusyBox，改用更底层的 /proc/meminfo
+    TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+    
+    if [ -z "$TOTAL_MEM" ] || [ "$TOTAL_MEM" -eq 0 ]; then
+        echo -e "${RED}❌ 无法读取系统内存信息${NC}"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}✓ 检测到内存: ${TOTAL_MEM}MB${NC}"
+
+    # 缓冲区 = 内存的 1/8，最小 8MB，最大 256MB
+    BUF_MB=$(( TOTAL_MEM / 8 ))
+    [ "$BUF_MB" -lt 8 ]   && BUF_MB=8
+    [ "$BUF_MB" -gt 256 ] && BUF_MB=256
+    BUF_BYTES=$(( BUF_MB * 1024 * 1024 ))
+
     if [ "$TOTAL_MEM" -lt 512 ]; then
         PROFILE="micro"
-        RMEM_MAX=8388608
-        WMEM_MAX=8388608
-        TCP_RMEM="4096 32768 8388608"
-        TCP_WMEM="4096 32768 8388608"
-        echo -e "${YELLOW}-> Using Micro profile (8MB buffer)${NC}"
+        echo -e "${YELLOW}→ 使用 Micro 配置 (极小内存优化)${NC}"
     elif [ "$TOTAL_MEM" -lt 1024 ]; then
         PROFILE="small"
-        RMEM_MAX=16777216
-        WMEM_MAX=16777216
-        TCP_RMEM="4096 65536 16777216"
-        TCP_WMEM="4096 65536 16777216"
-        echo -e "${YELLOW}-> Using Small profile (16MB buffer)${NC}"
+        echo -e "${YELLOW}→ 使用 Small 配置 (小内存优化)${NC}"
     elif [ "$TOTAL_MEM" -lt 2048 ]; then
         PROFILE="medium"
-        RMEM_MAX=33554432
-        WMEM_MAX=33554432
-        TCP_RMEM="4096 87380 33554432"
-        TCP_WMEM="4096 65536 33554432"
-        echo -e "${YELLOW}-> Using Medium profile (32MB buffer)${NC}"
+        echo -e "${YELLOW}→ 使用 Medium 配置 (中等内存)${NC}"
     elif [ "$TOTAL_MEM" -lt 4096 ]; then
         PROFILE="large"
-        RMEM_MAX=67108864
-        WMEM_MAX=67108864
-        TCP_RMEM="4096 87380 67108864"
-        TCP_WMEM="4096 65536 67108864"
-        echo -e "${YELLOW}-> Using Large profile (64MB buffer)${NC}"
+        echo -e "${YELLOW}→ 使用 Large 配置 (大内存)${NC}"
     else
         PROFILE="xlarge"
-        RMEM_MAX=134217728
-        WMEM_MAX=134217728
-        TCP_RMEM="4096 87380 134217728"
-        TCP_WMEM="4096 65536 134217728"
-        echo -e "${YELLOW}-> Using XLarge profile (128MB buffer)${NC}"
+        echo -e "${YELLOW}→ 使用 XLarge 配置 (超大内存)${NC}"
     fi
+
+    RMEM_MAX=$BUF_BYTES
+    WMEM_MAX=$BUF_BYTES
+    TCP_RMEM="4096 87380 $BUF_BYTES"
+    TCP_WMEM="4096 65536 $BUF_BYTES"
+    echo -e "${YELLOW}→ 动态计算缓冲区上限: ${BUF_MB}MB${NC}"
 }
 
-# Enable BBR
+# 启用 BBR
 enable_bbr() {
     echo ""
-    echo -e "${BLUE}==> Enabling BBR${NC}"
-    modprobe tcp_bbr 2>/dev/null || true
-    echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-    echo -e "${GREEN}[OK] BBR module loaded${NC}"
+    echo -e "${BLUE}==> 启用 BBR 模块${NC}"
+    
+    if [[ "$OS" == "openwrt" ]]; then
+        # OpenWrt 需要确认 kmod-tcp-bbr 模块
+        if ! modprobe tcp_bbr 2>/dev/null; then
+            echo -e "${YELLOW}→ 未检测到 tcp_bbr 模块，正在尝试通过 opkg 安装 kmod-tcp-bbr...${NC}"
+            opkg update >/dev/null 2>&1 && opkg install kmod-tcp-bbr >/dev/null 2>&1 || true
+            modprobe tcp_bbr 2>/dev/null || { echo -e "${RED}❌ 无法加载 tcp_bbr，请确认您的固件内核是否编译了 BBR 支持。${NC}"; exit 1; }
+        fi
+        # OpenWrt 模块持久化
+        if [ -d /etc/modules.d ]; then
+            echo "tcp_bbr" > /etc/modules.d/bbr
+        fi
+    else
+        # Debian/Ubuntu 逻辑
+        modprobe tcp_bbr 2>/dev/null || true
+        if [ -d /etc/modules-load.d ]; then
+            echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+        fi
+    fi
+    echo -e "${GREEN}✓ BBR 内核模块已加载${NC}"
 }
 
-# Backup config
+# 备份原配置
 backup_config() {
     if [ -f /etc/sysctl.conf ]; then
         cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)
-        echo -e "${GREEN}[OK] Config backed up${NC}"
+        echo -e "${GREEN}✓ 已备份原内核参数配置到 /etc/sysctl.conf.bak.*${NC}"
     fi
 }
 
-# Apply config
+# 写入优化参数
 apply_config() {
     echo ""
-    echo -e "${BLUE}==> Writing config (Profile: $PROFILE)${NC}"
-    sed -i "/# === BBR Blast/,/# === END BBR/d" /etc/sysctl.conf 2>/dev/null || true
+    echo -e "${BLUE}==> 写入内核优化参数 (Profile: $PROFILE)${NC}"
+    
+    # 幂等性：移除旧的 BBR 配置，防止多次运行产生重复参数
+    sed -i '/# === BBR Blast Smooth/,/# === END BBR/d' /etc/sysctl.conf 2>/dev/null || true
+    
     cat >> /etc/sysctl.conf <<SYSCTL
 
 # === BBR Blast Smooth v2 (Profile: $PROFILE) ===
+# 系统: $OS $VER | 内存: ${TOTAL_MEM}MB | 缓冲: ${BUF_MB}MB
+# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
+
+# BBR 拥塞控制
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+
+# 缓冲区 (动态计算)
 net.core.rmem_max=$RMEM_MAX
 net.core.wmem_max=$WMEM_MAX
 net.ipv4.tcp_rmem=$TCP_RMEM
 net.ipv4.tcp_wmem=$TCP_WMEM
+
+# 短连接 & 延迟优化
 net.ipv4.tcp_fin_timeout=8
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_window_scaling=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_sack=1
+
+# 避免保存历史 RTT，保持突发灵活
 net.ipv4.tcp_no_metrics_save=1
-net.core.somaxconn=65535
-net.ipv4.tcp_max_syn_backlog=65535
-net.ipv4.tcp_fastopen=3
 # === END BBR ===
 SYSCTL
-    echo -e "${GREEN}[OK] Config written${NC}"
+
+    echo -e "${GREEN}✓ 优化参数已写入系统配置${NC}"
 }
 
-# Reload
+# 应用配置
 reload_config() {
     echo ""
-    echo -e "${BLUE}==> Applying${NC}"
-    sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN}[OK] Applied${NC}"
+    echo -e "${BLUE}==> 重载系统配置${NC}"
+    
+    if [[ "$OS" == "openwrt" ]] && [ -x /etc/init.d/sysctl ]; then
+        /etc/init.d/sysctl restart >/dev/null 2>&1
+    else
+        sysctl -p >/dev/null 2>&1
+    fi
+    echo -e "${GREEN}✓ 系统参数已生效${NC}"
 }
 
-# Verify
+# 验证结果
 verify() {
     echo ""
-    echo -e "${BLUE}==> Verifying${NC}"
+    echo -e "${BLUE}==> 验证状态${NC}"
+    
     CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+    
     if [ "$CC" = "bbr" ] && [ "$QDISC" = "fq" ]; then
-        echo -e "${GREEN}[OK] Congestion: $CC${NC}"
-        echo -e "${GREEN}[OK] Qdisc: $QDISC${NC}"
+        echo -e "${GREEN}✓ 当前拥塞控制算法: $CC${NC}"
+        echo -e "${GREEN}✓ 当前排队规则: $QDISC${NC}"
     else
-        echo -e "${RED}[!] May need reboot${NC}"
+        echo -e "${RED}⚠ 配置可能未完全生效，如果为 OpenWrt 环境建议重启路由器测试${NC}"
     fi
 }
 
-# Summary
+# 显示摘要
 summary() {
     echo ""
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${GREEN}[DONE] BBR Blast Smooth v2 Complete!${NC}"
+    echo -e "${GREEN}✅ BBR Blast Smooth v2 部署并配置完成！${NC}"
     echo -e "${BLUE}========================================${NC}"
-    echo "OS: $OS $VER"
-    echo "Memory: ${TOTAL_MEM}MB"
-    echo "Profile: $PROFILE"
-    echo "Buffer: $(($RMEM_MAX/1024/1024))MB"
+    echo -e "系统环境: $OS $VER"
+    echo -e "物理内存: ${TOTAL_MEM} MB"
+    echo -e "调优级别: $PROFILE"
+    echo -e "动态缓冲: $(($RMEM_MAX/1024/1024)) MB"
+    echo ""
 }
 
-# Main
+# 主流程
 main() {
     detect_os
     detect_memory
