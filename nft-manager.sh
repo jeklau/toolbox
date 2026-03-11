@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
 # ====================================================
-# Nftables 端口转发管理工具 (双模式 & 严格模式版)
+# Nftables 端口转发管理工具 (全功能豪华版 V3)
 # ====================================================
 
 set -euo pipefail
 
-# 1. 环境与权限预检
 if [[ "${EUID}" -ne 0 ]]; then
     echo "❌ 错误: 此脚本必须以 root 权限运行。请使用 sudo 执行。" >&2
     exit 1
@@ -19,23 +18,17 @@ fi
 
 CONF_FILE="/etc/nftables.conf"
 
-# ====================================================
-# 功能函数定义
-# ====================================================
-
-# 开启内核转发
 enable_ip_forward() {
     echo "[*] 正在确保系统 IPv4 转发已开启..."
     echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-ipforward.conf
     sysctl -p /etc/sysctl.d/99-ipforward.conf > /dev/null 2>&1
 }
 
-# 交互式获取用户输入
 get_forward_inputs() {
     echo ""
     echo "请选择端口转发引擎模式："
-    echo "  1) ip nat (静态模式: 使用 SNAT，适合本机具有固定静态 IP)"
-    echo "  2) inet port_forward (动态模式: 使用 Masquerade，适合本机动态获取 IP)"
+    echo "  1) ip nat (静态模式: 使用 SNAT，适合内网转发，比如前置转发到IX)"
+    echo "  2) inet port_forward (动态模式: 使用 Masquerade，适合本机动态获取 IP，比如IX转发到落地)"
     read -r -p "▶ 请选择 [1-2]: " FW_MODE
     
     if [[ "${FW_MODE}" != "1" && "${FW_MODE}" != "2" ]]; then
@@ -43,26 +36,23 @@ get_forward_inputs() {
         exit 1
     fi
 
-    # 只有选择了静态 ip nat 模式，才需要输入本机内网 IP
     if [[ "${FW_MODE}" == "1" ]]; then
-        read -r -p "▶ 请输入本机内网 IP (SNAT 伪装用, 例如 10.100.1.1): " RELAY_LAN_IP
+        read -r -p "▶ 请输入本机内网 IP (SNAT 伪装用, 例如 10.1.1.1): " RELAY_LAN_IP
         [[ -z "${RELAY_LAN_IP}" ]] && { echo "❌ 错误: 本机内网 IP 不能为空"; exit 1; }
     fi
 
     read -r -p "▶ 请输入目标机器 IP (例如 1.1.1.1): " DEST_IP
     [[ -z "${DEST_IP}" ]] && { echo "❌ 错误: 目标 IP 不能为空"; exit 1; }
 
-    read -r -p "▶ 请输入需要转发的入口端口或范围 (例如 12345 或 12345-54312): " IN_PORT
+    read -r -p "▶ 请输入需要转发的入口端口或范围 (例如 12345 或 12345-54321): " IN_PORT
     [[ -z "${IN_PORT}" ]] && { echo "❌ 错误: 入口端口不能为空"; exit 1; }
 
     read -r -p "▶ 请输入目标机器接收的端口 (如与上面相同，请直接回车跳过): " OUT_PORT
 
-    # 逻辑处理：如果不填目标端口，则 1:1 等端口转发
     if [[ -z "${OUT_PORT}" ]]; then
         DNAT_TARGET="${DEST_IP}"
         SNAT_PORT_MATCH="${IN_PORT}"
     else
-        # 防呆设计：如果入口是范围，且填了单一出口端口，强制忽略出口端口
         if [[ "${IN_PORT}" == *"-"* && "${OUT_PORT}" != *"-"* ]]; then
             echo "⚠️  警告: 入口是一个端口范围，不支持映射到单一目标端口。已自动重置为等端口(1:1)转发。"
             DNAT_TARGET="${DEST_IP}"
@@ -74,7 +64,6 @@ get_forward_inputs() {
     fi
 }
 
-# 生成规则内容 (依据用户选择的引擎模式)
 generate_rules() {
     local is_append=$1
     local rule_content=""
@@ -84,7 +73,6 @@ generate_rules() {
     fi
 
     if [[ "${FW_MODE}" == "1" ]]; then
-        # 模式 1: table ip nat (静态 SNAT)
         rule_content+="table ip nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -98,7 +86,6 @@ generate_rules() {
     }
 }"
     elif [[ "${FW_MODE}" == "2" ]]; then
-        # 模式 2: table inet port_forward (动态 Masquerade)
         rule_content+="table inet port_forward {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -116,9 +103,11 @@ generate_rules() {
     echo -e "$rule_content"
 }
 
-# ====================================================
-# 主菜单循环
-# ====================================================
+save_rules() {
+    echo "[*] 正在持久化保存到 ${CONF_FILE} ..."
+    echo "#!/usr/sbin/nft -f" > "${CONF_FILE}"
+    nft list ruleset >> "${CONF_FILE}"
+}
 
 while true; do
     echo ""
@@ -129,9 +118,10 @@ while true; do
     echo "  2) 在原有规则上增加转发 (追加模式，不影响现有业务)"
     echo "  3) 一键清空所有转发规则"
     echo "  4) 查看当前生效的完整转发规则"
+    echo "  5) 批量删除单条/多条规则 (按 Handle 编号精准删除)"
     echo "  0) 退出脚本"
     echo "====================================================="
-    read -r -p "请输入选项 [0-4]: " CHOICE
+    read -r -p "请输入选项 [0-5]: " CHOICE
 
     case "$CHOICE" in
         1)
@@ -162,11 +152,7 @@ while true; do
             
             echo "[*] 正在追加规则到当前系统..."
             nft -f "${TMP_FILE}"
-            
-            # 持久化保存
-            echo "[*] 正在持久化保存到 ${CONF_FILE} ..."
-            echo "#!/usr/sbin/nft -f" > "${CONF_FILE}"
-            nft list ruleset >> "${CONF_FILE}"
+            save_rules
             
             rm -f "${TMP_FILE}"
             echo "✅ 转发规则已成功追加并保存！"
@@ -185,7 +171,7 @@ while true; do
             ;;
         4)
             echo "-----------------------------------------------------"
-            echo "当前系统生效的规则集如下 (包含全部模式)："
+            echo "当前系统生效的规则集如下："
             echo "-----------------------------------------------------"
             set +e
             RULES=$(nft list ruleset 2>/dev/null)
@@ -196,12 +182,83 @@ while true; do
             fi
             set -e
             ;;
+        5)
+            echo "-----------------------------------------------------"
+            echo "当前规则列表及 Handle 编号："
+            echo "-----------------------------------------------------"
+            set +e
+            RULES_WITH_HANDLE=$(nft -a list ruleset 2>/dev/null)
+            if [[ -z "$RULES_WITH_HANDLE" ]]; then
+                echo "当前系统没有任何生效的规则，无需删除。"
+                set -e
+                continue
+            fi
+            echo "$RULES_WITH_HANDLE"
+            set -e
+            echo "-----------------------------------------------------"
+            
+            # 简化协议族和表名的输入
+            echo "请选择你要操作的表域："
+            echo "  1) ip 协议族的 nat 表 (对应静态模式)"
+            echo "  2) inet 协议族的 port_forward 表 (对应动态模式)"
+            read -r -p "请输入 [1-2, 直接回车取消]: " TBL_CHOICE
+            
+            [[ -z "$TBL_CHOICE" ]] && continue
+            
+            if [[ "$TBL_CHOICE" == "1" ]]; then
+                D_FAM="ip"
+                D_TAB="nat"
+            elif [[ "$TBL_CHOICE" == "2" ]]; then
+                D_FAM="inet"
+                D_TAB="port_forward"
+            else
+                echo "❌ 无效的选择。"
+                continue
+            fi
+            
+            # 简化链名的输入
+            echo "请选择你要操作的链 (方向)："
+            echo "  1) prerouting (入站，即入口端口转发规则)"
+            echo "  2) postrouting (出站，即回程 SNAT/伪装规则)"
+            read -r -p "请输入 [1-2]: " CHN_CHOICE
+            
+            if [[ "$CHN_CHOICE" == "1" ]]; then
+                D_CHN="prerouting"
+            elif [[ "$CHN_CHOICE" == "2" ]]; then
+                D_CHN="postrouting"
+            else
+                echo "❌ 无效的选择。"
+                continue
+            fi
+            
+            # 批量输入 Handle 进行循环删除
+            read -r -p "请输入要删除的 Handle 编号 (多个编号用空格隔开，如 '5 8 12'): " D_HANS
+            [[ -z "$D_HANS" ]] && continue
+            
+            set +e
+            SUCCESS_COUNT=0
+            for H in $D_HANS; do
+                nft delete rule "$D_FAM" "$D_TAB" "$D_CHN" handle "$H" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    echo "✅ 成功删除 Handle $H"
+                    ((SUCCESS_COUNT++))
+                else
+                    echo "❌ 删除 Handle $H 失败 (可能编号不存在或输入有误)"
+                fi
+            done
+            set -e
+            
+            # 只要成功删除了至少一条规则，就触发持久化保存
+            if [ "$SUCCESS_COUNT" -gt 0 ]; then
+                save_rules
+            fi
+            ;;
         0)
             echo "退出程序。Bye!"
             exit 0
             ;;
         *)
-            echo "❌ 无效的选项，请输入 0-4 之间的数字。"
+            echo "❌ 无效的选项，请输入 0-5 之间的数字。"
             ;;
     esac
 done
