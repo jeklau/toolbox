@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 
 # ====================================================
-# Nftables 端口转发管理工具 (严格模式增强版)
+# Nftables 端口转发管理工具 (双模式 & 严格模式版)
 # ====================================================
 
-# 开启严格模式：防爆防呆
 set -euo pipefail
 
 # 1. 环境与权限预检
@@ -18,7 +17,6 @@ if ! command -v nft &> /dev/null; then
     exit 1
 fi
 
-# 配置文件路径
 CONF_FILE="/etc/nftables.conf"
 
 # ====================================================
@@ -35,13 +33,26 @@ enable_ip_forward() {
 # 交互式获取用户输入
 get_forward_inputs() {
     echo ""
-    read -r -p "▶ 请输入本机内网 IP (SNAT 伪装用, 例如 10.1.1.1): " RELAY_LAN_IP
-    [[ -z "${RELAY_LAN_IP}" ]] && { echo "❌ 错误: 本机内网 IP 不能为空"; exit 1; }
+    echo "请选择端口转发引擎模式："
+    echo "  1) ip nat (静态模式: 使用 SNAT，适合本机具有固定静态 IP)"
+    echo "  2) inet port_forward (动态模式: 使用 Masquerade，适合本机动态获取 IP)"
+    read -r -p "▶ 请选择 [1-2]: " FW_MODE
+    
+    if [[ "${FW_MODE}" != "1" && "${FW_MODE}" != "2" ]]; then
+        echo "❌ 错误: 无效的选择，请输入 1 或 2。"
+        exit 1
+    fi
 
-    read -r -p "▶ 请输入目标机器 IP (例如 172.16.1.1): " DEST_IP
+    # 只有选择了静态 ip nat 模式，才需要输入本机内网 IP
+    if [[ "${FW_MODE}" == "1" ]]; then
+        read -r -p "▶ 请输入本机内网 IP (SNAT 伪装用, 例如 10.100.1.1): " RELAY_LAN_IP
+        [[ -z "${RELAY_LAN_IP}" ]] && { echo "❌ 错误: 本机内网 IP 不能为空"; exit 1; }
+    fi
+
+    read -r -p "▶ 请输入目标机器 IP (例如 1.1.1.1): " DEST_IP
     [[ -z "${DEST_IP}" ]] && { echo "❌ 错误: 目标 IP 不能为空"; exit 1; }
 
-    read -r -p "▶ 请输入需要转发的入口端口或范围 (例如 12345 或 12345-54321): " IN_PORT
+    read -r -p "▶ 请输入需要转发的入口端口或范围 (例如 12345 或 12345-54312): " IN_PORT
     [[ -z "${IN_PORT}" ]] && { echo "❌ 错误: 入口端口不能为空"; exit 1; }
 
     read -r -p "▶ 请输入目标机器接收的端口 (如与上面相同，请直接回车跳过): " OUT_PORT
@@ -51,7 +62,7 @@ get_forward_inputs() {
         DNAT_TARGET="${DEST_IP}"
         SNAT_PORT_MATCH="${IN_PORT}"
     else
-        # 防呆设计：如果入口是范围，且填了单一出口端口，强制忽略出口端口以防配置报错
+        # 防呆设计：如果入口是范围，且填了单一出口端口，强制忽略出口端口
         if [[ "${IN_PORT}" == *"-"* && "${OUT_PORT}" != *"-"* ]]; then
             echo "⚠️  警告: 入口是一个端口范围，不支持映射到单一目标端口。已自动重置为等端口(1:1)转发。"
             DNAT_TARGET="${DEST_IP}"
@@ -63,7 +74,7 @@ get_forward_inputs() {
     fi
 }
 
-# 生成规则内容 (用于全新或追加)
+# 生成规则内容 (依据用户选择的引擎模式)
 generate_rules() {
     local is_append=$1
     local rule_content=""
@@ -72,7 +83,9 @@ generate_rules() {
         rule_content+="flush ruleset\n\n"
     fi
 
-    rule_content+="table ip nat {
+    if [[ "${FW_MODE}" == "1" ]]; then
+        # 模式 1: table ip nat (静态 SNAT)
+        rule_content+="table ip nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
         tcp dport ${IN_PORT} dnat to ${DNAT_TARGET}
@@ -84,6 +97,22 @@ generate_rules() {
         ip daddr ${DEST_IP} udp dport ${SNAT_PORT_MATCH} snat to ${RELAY_LAN_IP}
     }
 }"
+    elif [[ "${FW_MODE}" == "2" ]]; then
+        # 模式 2: table inet port_forward (动态 Masquerade)
+        rule_content+="table inet port_forward {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        meta nfproto ipv4 tcp dport ${IN_PORT} dnat to ${DNAT_TARGET}
+        meta nfproto ipv4 udp dport ${IN_PORT} dnat to ${DNAT_TARGET}
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr ${DEST_IP} tcp dport ${SNAT_PORT_MATCH} masquerade
+        ip daddr ${DEST_IP} udp dport ${SNAT_PORT_MATCH} masquerade
+    }
+}"
+    fi
+
     echo -e "$rule_content"
 }
 
@@ -99,7 +128,7 @@ while true; do
     echo "  1) 全新机器添加转发 (清空现有规则，仅保留本次新增)"
     echo "  2) 在原有规则上增加转发 (追加模式，不影响现有业务)"
     echo "  3) 一键清空所有转发规则"
-    echo "  4) 查看当前生效的转发规则"
+    echo "  4) 查看当前生效的完整转发规则"
     echo "  0) 退出脚本"
     echo "====================================================="
     read -r -p "请输入选项 [0-4]: " CHOICE
@@ -134,7 +163,7 @@ while true; do
             echo "[*] 正在追加规则到当前系统..."
             nft -f "${TMP_FILE}"
             
-            # 立即保存当前内存中的完整规则到配置文件，防止重启丢失
+            # 持久化保存
             echo "[*] 正在持久化保存到 ${CONF_FILE} ..."
             echo "#!/usr/sbin/nft -f" > "${CONF_FILE}"
             nft list ruleset >> "${CONF_FILE}"
@@ -156,11 +185,15 @@ while true; do
             ;;
         4)
             echo "-----------------------------------------------------"
-            echo "当前系统生效的 NAT 规则如下："
+            echo "当前系统生效的规则集如下 (包含全部模式)："
             echo "-----------------------------------------------------"
-            # 临时关闭 strict mode 中的 exit on error，防止表不存在时脚本直接崩溃退出
             set +e
-            nft list table ip nat 2>/dev/null || echo "当前没有任何 IPv4 NAT 规则。"
+            RULES=$(nft list ruleset 2>/dev/null)
+            if [[ -z "$RULES" ]]; then
+                echo "当前系统没有任何生效的规则。"
+            else
+                echo "$RULES"
+            fi
             set -e
             ;;
         0)
