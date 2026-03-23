@@ -1,37 +1,7 @@
-# 脚本工具箱
 来源：AI和互联网，仅用于服务器测试。
 
-## 多合一脚本，复制以下命令执行
+示例：
 
-```bash
-bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/toolbox.sh)
-```
-```
-====================================================
-           服务器运维工具箱 (N合一控制台)           
-====================================================
-  1. VPS 初始化配置 (vps_init.sh)
-  2. 开启 BBR 参数调优 (bbr-smart.sh)
-  3. 安装配置 Shadowsocks-Rust (ss-rust.sh)
-  4. 增加 nftables 转发 (nft-manager.sh)
-  0. 安全退出
-====================================================
-请输入对应任务的数字序号 [0-4]:
-```
-
-## 单一脚本
-
-智能调整BBR参数，适用 Debian/Ubuntu/OpenWRT
-```bash
-bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/bbr-smart.sh)
-```
-
-VPS初始化
-```bash
-bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/vps_init.sh)
-```
-
-增加NFT转发
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/nft-manager.sh)
 ```
