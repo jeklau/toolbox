@@ -1,7 +1,7 @@
 #!/bin/bash
-# BBR Blast Smooth v2 - 自动识别系统/内存智能调优版
-# 支持 Debian 11/12/13, Ubuntu 20.04/22.04/24.04, iStoreOS/OpenWrt
-# 根据内存大小自动调整缓冲区参数 🚀
+# BBR Blast Smooth v2.2 - 自动识别系统/内存智能调优版
+# 支持 Debian 11-13, Ubuntu 20.04-24.04, iStoreOS, OpenWrt, ImmortalWrt
+# 适配 OpenWrt 25.12+ 的 apk 包管理器及经典 opkg 🚀
 
 set -e
 
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}   BBR Blast Smooth v2 智能调优版${NC}"
+echo -e "${BLUE}   BBR Blast Smooth v2.2 智能调优版${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
@@ -23,10 +23,14 @@ detect_os() {
         . /etc/os-release
         OS=$ID
         VER=${VERSION_ID:-"unknown"}
+        REAL_NAME=${NAME:-$ID}
         
-        # 兼容处理 iStoreOS/OpenWrt
-        if [[ "$ID" == "istoreos" || "$NAME" == *"iStoreOS"* || "$ID" == "openwrt" ]]; then
+        # 兼容处理基于 OpenWrt 的衍生系统
+        if [[ "${ID,,}" == "istoreos" || "${NAME,,}" == *"istoreos"* || "${ID,,}" == "openwrt" || "${ID,,}" == "immortalwrt" || "${NAME,,}" == *"immortalwrt"* ]]; then
             OS="openwrt"
+            DISPLAY_OS="$REAL_NAME ($VER)"
+        else
+            DISPLAY_OS="$ID $VER"
         fi
     else
         echo -e "${RED}❌ 无法识别系统${NC}"
@@ -34,24 +38,11 @@ detect_os() {
     fi
     
     case "$OS" in
-        debian)
-            if [[ "$VER" =~ ^(11|12|13)$ ]]; then
-                echo -e "${GREEN}✓ 检测到 Debian $VER${NC}"
-            else
-                echo -e "${RED}❌ 仅支持 Debian 11/12/13${NC}"
-                exit 1
-            fi
-            ;;
-        ubuntu)
-            if [[ "$VER" =~ ^(20.04|22.04|24.04)$ ]]; then
-                echo -e "${GREEN}✓ 检测到 Ubuntu $VER${NC}"
-            else
-                echo -e "${RED}❌ 仅支持 Ubuntu 20.04/22.04/24.04${NC}"
-                exit 1
-            fi
+        debian|ubuntu)
+            echo -e "${GREEN}✓ 检测到 $DISPLAY_OS${NC}"
             ;;
         openwrt)
-            echo -e "${GREEN}✓ 检测到 iStoreOS/OpenWrt ($VER)${NC}"
+            echo -e "${GREEN}✓ 检测到 OpenWrt 系分支: $DISPLAY_OS${NC}"
             ;;
         *)
             echo -e "${RED}❌ 不支持的系统: $OS${NC}"
@@ -62,7 +53,7 @@ detect_os() {
 
 # 检测内存并设置参数
 detect_memory() {
-    # 弃用 free -m 以兼容 BusyBox，改用更底层的 /proc/meminfo
+    # 兼容 BusyBox，改用更底层的 /proc/meminfo
     TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
     
     if [ -z "$TOTAL_MEM" ] || [ "$TOTAL_MEM" -eq 0 ]; then
@@ -102,19 +93,32 @@ detect_memory() {
     echo -e "${YELLOW}→ 动态计算缓冲区上限: ${BUF_MB}MB${NC}"
 }
 
-# 启用 BBR
+# 启用 BBR (重点优化 apk/opkg 智能检测)
 enable_bbr() {
     echo ""
-    echo -e "${BLUE}==> 启用 BBR 模块${NC}"
+    echo -e "${BLUE}==> 启用 BBR 内核模块${NC}"
     
     if [[ "$OS" == "openwrt" ]]; then
-        # OpenWrt 需要确认 kmod-tcp-bbr 模块
+        # OpenWrt 系需要确认 kmod-tcp-bbr 模块
         if ! modprobe tcp_bbr 2>/dev/null; then
-            echo -e "${YELLOW}→ 未检测到 tcp_bbr 模块，正在尝试通过 opkg 安装 kmod-tcp-bbr...${NC}"
-            opkg update >/dev/null 2>&1 && opkg install kmod-tcp-bbr >/dev/null 2>&1 || true
+            echo -e "${YELLOW}→ 未检测到 tcp_bbr 模块，准备尝试通过包管理器安装...${NC}"
+            
+            # 智能探测包管理器：优先检测 apk (新版 OpenWrt)，回退检测 opkg
+            if command -v apk >/dev/null 2>&1; then
+                echo -e "${GREEN}✓ 检测到 apk 包管理器 (OpenWrt 25.12+)${NC}"
+                apk update >/dev/null 2>&1 && apk add kmod-tcp-bbr >/dev/null 2>&1 || true
+            elif command -v opkg >/dev/null 2>&1; then
+                echo -e "${GREEN}✓ 检测到 opkg 包管理器 (经典版本)${NC}"
+                opkg update >/dev/null 2>&1 && opkg install kmod-tcp-bbr >/dev/null 2>&1 || true
+            else
+                echo -e "${RED}❌ 未找到 apk 或 opkg，无法自动安装模块。${NC}"
+            fi
+
+            # 再次尝试加载
             modprobe tcp_bbr 2>/dev/null || { echo -e "${RED}❌ 无法加载 tcp_bbr，请确认您的固件内核是否编译了 BBR 支持。${NC}"; exit 1; }
         fi
-        # OpenWrt 模块持久化
+        
+        # OpenWrt 模块开机自启
         if [ -d /etc/modules.d ]; then
             echo "tcp_bbr" > /etc/modules.d/bbr
         fi
@@ -125,7 +129,7 @@ enable_bbr() {
             echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
         fi
     fi
-    echo -e "${GREEN}✓ BBR 内核模块已加载${NC}"
+    echo -e "${GREEN}✓ BBR 内核模块已就绪${NC}"
 }
 
 # 备份原配置
@@ -141,33 +145,28 @@ apply_config() {
     echo ""
     echo -e "${BLUE}==> 写入内核优化参数 (Profile: $PROFILE)${NC}"
     
-    # 幂等性：移除旧的 BBR 配置，防止多次运行产生重复参数
+    # 幂等性：移除旧的 BBR 配置
     sed -i '/# === BBR Blast Smooth/,/# === END BBR/d' /etc/sysctl.conf 2>/dev/null || true
     
     cat >> /etc/sysctl.conf <<SYSCTL
 
-# === BBR Blast Smooth v2 (Profile: $PROFILE) ===
-# 系统: $OS $VER | 内存: ${TOTAL_MEM}MB | 缓冲: ${BUF_MB}MB
+# === BBR Blast Smooth v2.2 (Profile: $PROFILE) ===
+# 系统: $DISPLAY_OS | 内存: ${TOTAL_MEM}MB | 缓冲: ${BUF_MB}MB
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 
-# BBR 拥塞控制
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# 缓冲区 (动态计算)
 net.core.rmem_max=$RMEM_MAX
 net.core.wmem_max=$WMEM_MAX
 net.ipv4.tcp_rmem=$TCP_RMEM
 net.ipv4.tcp_wmem=$TCP_WMEM
 
-# 短连接 & 延迟优化
 net.ipv4.tcp_fin_timeout=8
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_window_scaling=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_sack=1
-
-# 避免保存历史 RTT，保持突发灵活
 net.ipv4.tcp_no_metrics_save=1
 # === END BBR ===
 SYSCTL
@@ -197,10 +196,10 @@ verify() {
     QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     
     if [ "$CC" = "bbr" ] && [ "$QDISC" = "fq" ]; then
-        echo -e "${GREEN}✓ 当前拥塞控制算法: $CC${NC}"
+        echo -e "${GREEN}✓ 当前拥塞控制: $CC${NC}"
         echo -e "${GREEN}✓ 当前排队规则: $QDISC${NC}"
     else
-        echo -e "${RED}⚠ 配置可能未完全生效，如果为 OpenWrt 环境建议重启路由器测试${NC}"
+        echo -e "${RED}⚠ 配置可能未完全生效，由于内核版本或防火墙环境差异，建议重启系统${NC}"
     fi
 }
 
@@ -208,11 +207,10 @@ verify() {
 summary() {
     echo ""
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${GREEN}✅ BBR Blast Smooth v2 部署并配置完成！${NC}"
+    echo -e "${GREEN}✅ BBR 智能调优配置完成！${NC}"
     echo -e "${BLUE}========================================${NC}"
-    echo -e "系统环境: $OS $VER"
+    echo -e "系统环境: $DISPLAY_OS"
     echo -e "物理内存: ${TOTAL_MEM} MB"
-    echo -e "调优级别: $PROFILE"
     echo -e "动态缓冲: $(($RMEM_MAX/1024/1024)) MB"
     echo ""
 }
