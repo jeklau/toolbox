@@ -1,5 +1,24 @@
-#!/bin/bash
+#!/bin/sh
+# shellcheck shell=bash
+# Alpine 可使用 sh ss-rust.sh 启动；仅以下引导段使用 POSIX sh 语法。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ ! -f "$0" ]; then
+        printf '%s\n' '请先下载脚本，再运行 sh ss-rust.sh；不要通过管道传给 sh。' >&2
+        exit 1
+    fi
+    if ! command -v bash >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+            apk add --no-cache bash || exit 1
+        else
+            printf '%s\n' '请先安装 Bash，再运行此脚本。' >&2
+            exit 1
+        fi
+    fi
+    exec bash "$0" "$@"
+fi
+
 # SS-Rust 一键安装脚本
+# 系统: systemd Linux / Alpine Linux (OpenRC + musl)
 # 支持: ss2022 (2022-blake3-aes-128-gcm) / ss128 (aes-128-gcm) / 双节点
 # 自动生成 SS订阅 + Surge + Clash 配置
 # GitHub: https://github.com/mango082888-bit/ss-rust
@@ -45,18 +64,66 @@ get_pkg_manager() {
 install_deps() {
     info "安装依赖..."
     case $PKG in
-        apt) apt update -qq &>/dev/null; apt install -y -qq curl openssl xz-utils tar chrony python3 &>/dev/null ;;
-        yum) yum install -y -q curl openssl xz tar chrony python3 &>/dev/null ;;
-        apk) apk add --quiet curl openssl xz tar chrony python3 &>/dev/null ;;
-    esac
+        apt) apt update -qq && apt install -y -qq ca-certificates curl openssl xz-utils tar chrony python3 ;;
+        yum) yum install -y -q ca-certificates curl openssl xz tar chrony python3 ;;
+        apk) apk add --no-cache --quiet bash ca-certificates curl openssl xz tar chrony chrony-openrc python3 openrc ;;
+        *) error "请先检测包管理器" ;;
+    esac || error "依赖安装失败，请检查软件源和网络后重试"
 }
 
 get_arch() {
+    local libc="gnu"
+    [[ -f /etc/alpine-release ]] && libc="musl"
     case $(uname -m) in
-        x86_64)  echo "x86_64-unknown-linux-gnu" ;;
-        aarch64) echo "aarch64-unknown-linux-gnu" ;;
-        armv7l)  echo "armv7-unknown-linux-gnueabihf" ;;
+        x86_64)  echo "x86_64-unknown-linux-${libc}" ;;
+        aarch64) echo "aarch64-unknown-linux-${libc}" ;;
+        armv7l)  echo "armv7-unknown-linux-${libc}eabihf" ;;
         *)       error "不支持的架构: $(uname -m)" ;;
+    esac
+}
+
+# ============ 服务管理 (systemd / OpenRC) ============
+get_service_manager() {
+    if command -v rc-service &>/dev/null && command -v rc-update &>/dev/null; then
+        INIT="openrc"
+    elif command -v systemctl &>/dev/null; then
+        INIT="systemd"
+    else
+        error "未找到 systemd 或 OpenRC；Alpine 请先运行 apk add openrc"
+    fi
+}
+
+service_action() {
+    get_service_manager
+    case $INIT in
+        openrc) rc-service ss-rust "$1" ;;
+        systemd) systemctl "$1" ss-rust ;;
+    esac
+}
+
+service_is_active() {
+    get_service_manager
+    case $INIT in
+        openrc) rc-service ss-rust status &>/dev/null ;;
+        systemd) systemctl is-active --quiet ss-rust ;;
+    esac
+}
+
+service_status() {
+    if service_is_active; then echo "active"; else echo "inactive"; fi
+}
+
+service_logs() {
+    get_service_manager
+    case $INIT in
+        openrc)
+            if [[ -f /var/log/ss-rust.log ]]; then
+                tail -n "${1:-30}" /var/log/ss-rust.log
+            else
+                warn "暂无日志: /var/log/ss-rust.log"
+            fi
+            ;;
+        systemd) journalctl -u ss-rust --no-pager -n "${1:-30}" ;;
     esac
 }
 
@@ -70,21 +137,27 @@ get_ip() {
 # ============ 时间同步 ============
 sync_time() {
     info "同步系统时间..."
-    if command -v timedatectl &>/dev/null; then
+    get_service_manager
+    if [[ "$INIT" == "systemd" ]] && command -v timedatectl &>/dev/null; then
         timedatectl set-ntp true 2>/dev/null || true
     fi
     if command -v chronyd &>/dev/null; then
-        systemctl enable --now chronyd 2>/dev/null || true
+        if [[ "$INIT" == "openrc" ]]; then
+            rc-update add chronyd default 2>/dev/null || warn "chronyd 开机启动设置失败"
+            rc-service chronyd start 2>/dev/null || warn "chronyd 启动失败，请检查时间同步"
+        else
+            systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony 2>/dev/null || true
+        fi
         chronyc makestep 2>/dev/null || true
     fi
     info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 }
 
 # ============ 安装 ss-rust ============
-install_ssrust() {
+install_ssrust() (
     info "安装 shadowsocks-rust..."
     local arch_name
-    arch_name=$(get_arch)
+    arch_name=$(get_arch) || error "无法选择当前系统的二进制文件"
 
     local latest
     latest=$(curl -sLm10 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest | grep tag_name | head -1 | sed 's/.*"v/v/;s/".*//')
@@ -93,9 +166,11 @@ install_ssrust() {
 
     local url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${latest}/shadowsocks-${latest}.${arch_name}.tar.xz"
 
-    cd /tmp
-    rm -f ss-rust-dl.tar.xz ssserver sslocal ssurl ssmanager ssservice
-    curl -sLm120 "$url" -o ss-rust-dl.tar.xz
+    local download_dir
+    download_dir=$(mktemp -d) || error "无法创建下载目录"
+    trap 'rm -rf -- "$download_dir"' EXIT
+    cd "$download_dir" || error "无法进入下载目录"
+    curl -fSLm120 "$url" -o ss-rust-dl.tar.xz || error "下载失败: $url"
 
     local fsize
     fsize=$(stat -c%s ss-rust-dl.tar.xz 2>/dev/null || stat -f%z ss-rust-dl.tar.xz 2>/dev/null)
@@ -108,14 +183,16 @@ install_ssrust() {
     tar xf ss-rust-dl.tar.xz || error "解压失败"
     [[ ! -f ssserver ]] && error "找不到 ssserver"
 
-    cp -f ssserver /usr/local/bin/
+    mkdir -p /usr/local/bin || error "无法创建安装目录"
+    cp -f ssserver /usr/local/bin/ || error "无法安装 ssserver"
     cp -f sslocal /usr/local/bin/ 2>/dev/null || true
-    chmod +x /usr/local/bin/ssserver /usr/local/bin/sslocal 2>/dev/null
+    chmod +x /usr/local/bin/ssserver || error "无法设置 ssserver 执行权限"
+    [[ ! -f /usr/local/bin/sslocal ]] || chmod +x /usr/local/bin/sslocal
 
     rm -f ss-rust-dl.tar.xz ssserver sslocal ssurl ssmanager ssservice
 
     /usr/local/bin/ssserver --version && info "shadowsocks-rust 安装完成" || error "安装验证失败"
-}
+)
 
 # ============ 节点选择 + 端口密码 + 写配置 ============
 select_and_configure() {
@@ -192,9 +269,39 @@ print('OK')
     info "配置文件: /etc/shadowsocks-rust/config.json"
 }
 
-# ============ systemd 服务 ============
+# ============ 安装服务 ============
 setup_service() {
-    cat > /etc/systemd/system/ss-rust.service << 'EOF'
+    get_service_manager
+    if [[ "$INIT" == "openrc" ]]; then
+        mkdir -p /etc/init.d
+        cat > /etc/init.d/ss-rust << 'EOF'
+#!/sbin/openrc-run
+name="ss-rust"
+description="Shadowsocks-Rust Server"
+supervisor="supervise-daemon"
+command="/usr/local/bin/ssserver"
+command_args="-c /etc/shadowsocks-rust/config.json"
+pidfile="/run/${RC_SVCNAME}.pid"
+respawn_delay=5
+respawn_max=0
+output_log="/var/log/ss-rust.log"
+error_log="/var/log/ss-rust.log"
+rc_ulimit="-n 65535"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --file --mode 0600 --owner root:root "$output_log"
+}
+EOF
+        chmod +x /etc/init.d/ss-rust || error "无法设置 OpenRC 服务权限"
+        rc-update add ss-rust default || error "无法设置 ss-rust 开机启动"
+    else
+        mkdir -p /etc/systemd/system
+        cat > /etc/systemd/system/ss-rust.service << 'EOF'
 [Unit]
 Description=Shadowsocks-Rust Server
 After=network.target
@@ -210,14 +317,20 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable --now ss-rust
+        systemctl daemon-reload || error "systemd 重载失败"
+        systemctl enable ss-rust || error "无法设置 ss-rust 开机启动"
+    fi
+    if service_is_active; then
+        service_action restart || error "ss-rust 服务重启失败"
+    else
+        service_action start || error "ss-rust 服务启动失败"
+    fi
     sleep 2
 
-    if systemctl is-active --quiet ss-rust; then
+    if service_is_active; then
         info "ss-rust 服务启动成功"
     else
-        journalctl -u ss-rust -n 5 --no-pager
+        service_logs 5
         error "ss-rust 服务启动失败"
     fi
 }
@@ -256,7 +369,7 @@ gen_subscribe() {
     local uris="" surge="" clash="" info_txt=""
 
     if [[ -n "$PORT_2022" ]]; then
-        local uri="ss://$(echo -n "${METHOD_2022}:${KEY_2022}" | base64 -w0)@${SERVER_IP}:${PORT_2022}#SS2022-128"
+        local uri="ss://$(printf '%s' "${METHOD_2022}:${KEY_2022}" | base64 | tr -d '\n')@${SERVER_IP}:${PORT_2022}#SS2022-128"
         URI_2022="$uri"
         uris="${uris}${uri}\n"
         surge="${surge}SS2022-128 = ss, ${SERVER_IP}, ${PORT_2022}, encrypt-method=${METHOD_2022}, password=${KEY_2022}\n"
@@ -265,7 +378,7 @@ gen_subscribe() {
     fi
 
     if [[ -n "$PORT_RAW" ]]; then
-        local uri="ss://$(echo -n "${METHOD_RAW}:${KEY_RAW}" | base64 -w0)@${SERVER_IP}:${PORT_RAW}#SS-AES-128"
+        local uri="ss://$(printf '%s' "${METHOD_RAW}:${KEY_RAW}" | base64 | tr -d '\n')@${SERVER_IP}:${PORT_RAW}#SS-AES-128"
         URI_RAW="$uri"
         uris="${uris}${uri}\n"
         surge="${surge}SS-AES-128 = ss, ${SERVER_IP}, ${PORT_RAW}, encrypt-method=${METHOD_RAW}, password=${KEY_RAW}\n"
@@ -273,7 +386,7 @@ gen_subscribe() {
         info_txt="${info_txt}【SS-AES-128】传统协议\n  地址: ${SERVER_IP}\n  端口: ${PORT_RAW}\n  加密: ${METHOD_RAW}\n  密码: ${KEY_RAW}\n\n"
     fi
 
-    echo -e "$uris" | base64 -w0 > "$sub_dir/subscribe.txt"
+    echo -e "$uris" | base64 | tr -d '\n' > "$sub_dir/subscribe.txt"
 
     echo -e "# Surge SS | $(date '+%Y-%m-%d %H:%M:%S') | ${SERVER_IP}\n[Proxy]\n${surge}" > "$sub_dir/surge.conf"
     echo -e "# Clash SS | $(date '+%Y-%m-%d %H:%M:%S')\nproxies:\n${clash}" > "$sub_dir/clash.yaml"
@@ -332,7 +445,7 @@ show_result() {
 show_config() {
     load_config || error "未安装"
     echo ""
-    echo -e "${CYAN}  📋 当前配置 | 状态: $(systemctl is-active ss-rust 2>/dev/null)${NC}"
+    echo -e "${CYAN}  📋 当前配置 | 状态: $(service_status)${NC}"
     echo ""
     cat /etc/shadowsocks-rust/config.json
     echo ""
@@ -359,7 +472,7 @@ if 0 <= idx < len(c['servers']):
     with open('/etc/shadowsocks-rust/config.json','w') as f:
         json.dump(c, f, indent=4)
 "
-    systemctl restart ss-rust
+    service_action restart || error "ss-rust 服务重启失败"
     gen_subscribe
     info "端口已改为 ${new_port}"
 }
@@ -376,7 +489,7 @@ for s in c['servers']:
 with open('/etc/shadowsocks-rust/config.json','w') as f:
     json.dump(c, f, indent=4)
 "
-    systemctl restart ss-rust
+    service_action restart || error "ss-rust 服务重启失败"
     gen_subscribe
     info "密钥已重置"
     show_result
@@ -528,12 +641,18 @@ SYSCTL
 # ============ 卸载 ============
 uninstall() {
     warn "卸载 shadowsocks-rust..."
-    systemctl stop ss-rust 2>/dev/null
-    systemctl disable ss-rust 2>/dev/null
-    rm -f /etc/systemd/system/ss-rust.service
+    get_service_manager
+    service_action stop 2>/dev/null || true
+    if [[ "$INIT" == "openrc" ]]; then
+        rc-update del ss-rust default 2>/dev/null || true
+        rm -f /etc/init.d/ss-rust /var/log/ss-rust.log
+    else
+        systemctl disable ss-rust 2>/dev/null || true
+        rm -f /etc/systemd/system/ss-rust.service
+        systemctl daemon-reload
+    fi
     rm -f /usr/local/bin/ssserver /usr/local/bin/sslocal /usr/local/bin/ssurl
     rm -rf /etc/shadowsocks-rust
-    systemctl daemon-reload
     info "卸载完成"
 }
 
@@ -542,7 +661,7 @@ do_install() {
     get_pkg_manager
     install_deps
     sync_time
-    install_ssrust
+    install_ssrust || error "shadowsocks-rust 安装失败"
     select_and_configure
     setup_service
     gen_subscribe
@@ -579,10 +698,10 @@ show_menu() {
         2) show_config ;;
         3) change_port ;;
         4) reset_keys ;;
-        5) systemctl start ss-rust && info "已启动" ;;
-        6) systemctl stop ss-rust && info "已停止" ;;
-        7) systemctl restart ss-rust && info "已重启" ;;
-        8) journalctl -u ss-rust --no-pager -n 30 ;;
+        5) service_action start && info "已启动" ;;
+        6) service_action stop && info "已停止" ;;
+        7) service_action restart && info "已重启" ;;
+        8) service_logs ;;
         9) uninstall ;;
         10) setup_bbr ;;
         0) exit 0 ;;
@@ -592,15 +711,22 @@ show_menu() {
 
 # ============ 主入口 ============
 main() {
+    case "${1:-}" in
+        -h|--help|help)
+            echo "用法: sh ss-rust.sh [install|uninstall|show|restart|start|stop|logs|reset|bbr]"
+            echo "支持 systemd Linux 和 Alpine Linux (OpenRC + musl)；安装和管理需要 root。"
+            return 0
+            ;;
+    esac
     check_root
     case "${1:-}" in
         install)            do_install ;;
         uninstall|remove)   uninstall ;;
         show|config|info)   show_config ;;
-        restart)            systemctl restart ss-rust && info "已重启" ;;
-        start)              systemctl start ss-rust && info "已启动" ;;
-        stop)               systemctl stop ss-rust && info "已停止" ;;
-        log|logs)           journalctl -u ss-rust --no-pager -n 30 ;;
+        restart)            service_action restart && info "已重启" ;;
+        start)              service_action start && info "已启动" ;;
+        stop)               service_action stop && info "已停止" ;;
+        log|logs)           service_logs ;;
         reset)              reset_keys ;;
         bbr)                setup_bbr ;;
         *)
@@ -613,4 +739,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

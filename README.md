@@ -18,3 +18,19 @@ bash <(curl -sL https://raw.githubusercontent.com/jeklau/toolbox/main/nft-manage
 =====================================================
 请输入选项 [0-5]: 
 ```
+
+### SS-Rust：Alpine Linux
+
+支持 Alpine Linux（OpenRC + musl）的 x86_64、aarch64 和 armv7l。
+以 root 用户先下载脚本，再运行；Alpine 未安装 Bash 时会自动通过 `apk` 安装。
+
+```sh
+wget -O ss-rust.sh https://raw.githubusercontent.com/jeklau/toolbox/main/ss-rust.sh
+sh ss-rust.sh install
+```
+
+安装后可运行 `sh ss-rust.sh` 打开管理菜单，或使用 `start`、`stop`、
+`restart`、`show`、`logs`、`reset`、`uninstall` 子命令。
+OpenRC 服务名为 `ss-rust`，加入 `default` 运行级别，日志位于
+`/var/log/ss-rust.log`；配置和订阅仍保存在 `/etc/shadowsocks-rust/`。
+Debian/Ubuntu 等系统继续使用 systemd。BBR 是可选项，取决于主机内核支持和权限。
