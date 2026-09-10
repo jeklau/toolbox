@@ -77,7 +77,10 @@ fi
 exec /sbin/rc-service "$@"
 EOF
 else
-    systemctl is-system-running || [[ $(systemctl is-system-running) == degraded ]]
+    # Hosted runners may still report "starting" while unrelated boot jobs run.
+    # Verify the real manager is reachable; service operations below are the gate.
+    [[ -d /run/systemd/system ]]
+    systemctl show --property=Version
     cat > "$scratch/bin/systemctl" <<'EOF'
 #!/bin/sh
 case "$*" in
