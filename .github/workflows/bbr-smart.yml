@@ -1,0 +1,67 @@
+name: BBR Smart compatibility
+
+on:
+  pull_request:
+    paths: ['bbr-smart.sh', 'tests/bbr-smart/**', '.github/workflows/bbr-smart.yml']
+  push:
+    branches: [main]
+    paths: ['bbr-smart.sh', 'tests/bbr-smart/**', '.github/workflows/bbr-smart.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bbr-smart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alpine:
+    name: Alpine ${{ matrix.version }} / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['3.22', '3.23']
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare real BBR and fq modules in the disposable runner
+        run: |
+          sudo modprobe tcp_bbr
+          sudo modprobe sch_fq
+      - name: Test BusyBox, failure paths and real kernel settings
+        env:
+          ALPINE_VERSION: ${{ matrix.version }}
+        run: |
+          docker run --rm --privileged --network host \
+            -e BBR_TEST_DISPOSABLE=1 \
+            -v /lib/modules:/lib/modules:ro -v "$PWD:/repo:ro" -w /repo \
+            "alpine:$ALPINE_VERSION" sh -ec '
+              ! command -v bash
+              apk add --no-cache openrc
+              sh -n bbr-smart.sh
+              sh tests/bbr-smart/cases.sh
+              sh tests/bbr-smart/live.sh
+            '
+  ubuntu:
+    name: Ubuntu 24.04 / dash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check portable shell syntax
+        run: |
+          dash -n bbr-smart.sh
+          shellcheck --severity=warning bbr-smart.sh tests/bbr-smart/*.sh
+      - name: Test real kernel settings on disposable Ubuntu
+        run: |
+          sudo modprobe tcp_bbr
+          sudo modprobe sch_fq
+          sudo env BBR_TEST_DISPOSABLE=1 sh tests/bbr-smart/cases.sh
+          sudo env BBR_TEST_DISPOSABLE=1 sh tests/bbr-smart/live.sh
