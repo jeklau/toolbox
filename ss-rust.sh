@@ -669,7 +669,9 @@ do_install() {
     echo ""
     read -rp "是否开启 BBR 加速? [Y/n]: " bbr_choice
     bbr_choice=${bbr_choice:-Y}
-    [[ "$bbr_choice" =~ ^[Yy]$ ]] && setup_bbr
+    if [[ "$bbr_choice" =~ ^[Yy]$ ]]; then
+        setup_bbr
+    fi
 }
 
 # ============ 管理菜单 ============
