@@ -1,0 +1,54 @@
+name: SS-Rust compatibility
+
+on:
+  push:
+    branches: [main]
+    paths: ['ss-rust.sh', 'tests/ss-rust/**', '.github/workflows/ss-rust.yml']
+  pull_request:
+    paths: ['ss-rust.sh', 'tests/ss-rust/**', '.github/workflows/ss-rust.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ss-rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alpine:
+    name: Alpine ${{ matrix.alpine }} / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        alpine: ['3.22', '3.23']
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test clean Alpine installation and OpenRC lifecycle
+        env:
+          ALPINE_VERSION: ${{ matrix.alpine }}
+        run: |
+          docker run --rm --init --ulimit nofile=65535:65535 \
+            -e SS_RUST_TEST_ENV=disposable \
+            -v "$PWD:/repo:ro" -w /repo "alpine:$ALPINE_VERSION" \
+            sh -ec '! command -v bash; sh ./ss-rust.sh --help; exec bash tests/ss-rust/integration.sh openrc'
+  systemd:
+    name: Ubuntu 24.04 / systemd
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check syntax and ShellCheck errors
+        run: |
+          bash -n ss-rust.sh
+          bash -n tests/ss-rust/integration.sh
+          shellcheck --severity=error ss-rust.sh tests/ss-rust/integration.sh
+      - name: Test installation and systemd lifecycle
+        run: sudo env SS_RUST_TEST_ENV=disposable bash tests/ss-rust/integration.sh systemd
