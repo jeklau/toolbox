@@ -462,16 +462,26 @@ change_port() {
     read -rp "节点编号: " pn
     read -rp "新端口: " new_port
 
-    python3 -c "
-import json
+    python3 - "$pn" "$new_port" <<'PY' || error "修改端口失败"
+import json, sys
+try:
+    method = {'1': '2022-blake3-aes-128-gcm', '2': 'aes-128-gcm'}[sys.argv[1]]
+    port = int(sys.argv[2])
+except (KeyError, ValueError):
+    raise SystemExit('节点编号或端口无效')
+if not 1 <= port <= 65535:
+    raise SystemExit('端口必须在 1-65535 之间')
 with open('/etc/shadowsocks-rust/config.json') as f:
     c = json.load(f)
-idx = int('${pn}') - 1
-if 0 <= idx < len(c['servers']):
-    c['servers'][idx]['server_port'] = int('${new_port}')
-    with open('/etc/shadowsocks-rust/config.json','w') as f:
-        json.dump(c, f, indent=4)
-"
+server = next((s for s in c['servers'] if s['method'] == method), None)
+if server is None:
+    raise SystemExit('所选节点未安装')
+if any(s is not server and s['server_port'] == port for s in c['servers']):
+    raise SystemExit('端口已被另一个节点使用')
+server['server_port'] = port
+with open('/etc/shadowsocks-rust/config.json', 'w') as f:
+    json.dump(c, f, indent=4)
+PY
     service_action restart || error "ss-rust 服务重启失败"
     gen_subscribe
     info "端口已改为 ${new_port}"

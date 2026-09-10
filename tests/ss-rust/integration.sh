@@ -92,7 +92,12 @@ fi
 chmod +x "$scratch/bin/"*
 export PATH="$scratch/bin:$PATH"
 
-run_script() { bash "$repo/ss-rust.sh" "$@"; }
+run_script() {
+    # Respect systemd's normal start-rate limit when driving many CLI actions
+    # back-to-back; keep the production restart protection enabled.
+    if [[ $init == systemd ]]; then sleep 3; fi
+    bash "$repo/ss-rust.sh" "$@"
+}
 active() {
     if [[ $init == openrc ]]; then
         rc-service ss-rust status
@@ -173,6 +178,14 @@ EOF
     active
     wait_ports "$port"
     verify "$port"
+    changed_port=$((port + 100))
+    run_script > "$scratch/single-port-$node.log" <<EOF
+3
+$node
+$changed_port
+EOF
+    wait_ports "$changed_port"
+    verify "$changed_port"
 done
 run_script uninstall
 [[ ! -e /etc/shadowsocks-rust && ! -e /usr/local/bin/ssserver ]]
